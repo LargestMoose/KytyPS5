@@ -208,7 +208,7 @@ void MainDialogPrivate::FindInterpreter() {
 	}
 
 	bool found = QFile::exists(m_interpreter);
-	m_ui->widget->SetRuntimeDirectory(QFileInfo(m_interpreter).absolutePath());
+	m_ui->widget->SetRuntimeDirectory(QApplication::applicationDirPath());
 
 	if (found) {
 		m_ui->label_Interpreter->setText(tr("Emulator: ") + m_interpreter);
@@ -315,6 +315,10 @@ static QStringList CreateEmulatorArgs(const Configuration& info) {
 	}
 	args << "--keyboard-player" << QString::number(info.controller.keyboard_player);
 	args << "--present-mode" << EnumToText(info.present_mode);
+	args << "--upscaler" << EnumToText(info.upscaler_type).toLower();
+	args << "--upscale-quality" << EnumToText(info.upscale_quality);
+	args << "--upscale-sharpness" << QString::number(info.upscale_sharpness);
+	args << "--frame-gen" << BoolArg(info.frame_generation_enabled);
 	if (info.gpu_index >= 0) {
 		args << "--gpu" << QString::number(info.gpu_index);
 	}
@@ -531,7 +535,7 @@ void MainDialog::RunInterpreter(QProcess* process, const Configuration& info) {
 	process->setProgram(interpreter);
 	process->setArguments(args);
 #endif
-	process->setWorkingDirectory(dir.path());
+	process->setWorkingDirectory(QApplication::applicationDirPath());
 #if defined(_WIN32)
 	process->setCreateProcessArgumentsModifier([](QProcess::CreateProcessArguments* args) {
 		args->flags |= static_cast<uint32_t>(CREATE_NEW_CONSOLE);

@@ -94,6 +94,27 @@ static uint64_t AlignUp(uint64_t value, uint64_t alignment) {
 	return alignment != 0 ? (value + alignment - 1) & ~(alignment - 1) : value;
 }
 
+ThreadLocalStorage::Block::~Block() {
+	FreeTlsBlock(this);
+}
+
+ThreadLocalStorage::Block::Block(Block&& other) noexcept
+    : ptr(std::exchange(other.ptr, nullptr)),
+      free_func(std::exchange(other.free_func, nullptr)),
+      vm_alloc(std::exchange(other.vm_alloc, false)),
+      alloc_size(std::exchange(other.alloc_size, 0)) {}
+
+ThreadLocalStorage::Block& ThreadLocalStorage::Block::operator=(Block&& other) noexcept {
+	if (this != &other) {
+		FreeTlsBlock(this);
+		ptr        = std::exchange(other.ptr, nullptr);
+		free_func  = std::exchange(other.free_func, nullptr);
+		vm_alloc   = std::exchange(other.vm_alloc, false);
+		alloc_size = std::exchange(other.alloc_size, 0);
+	}
+	return *this;
+}
+
 ThreadLocalStorage::~ThreadLocalStorage() {
 	for (auto& [_, block]: tlss) {
 		FreeTlsBlock(&block);
@@ -134,7 +155,15 @@ struct StubbedImportRecord {
 // Each thunk passes its record's address: records never move, so a stub call reads its record
 // without touching the vector (which grows while modules load).
 static std::vector<std::unique_ptr<StubbedImportRecord>> g_stubbed_imports;
-static std::vector<uint64_t>            g_unresolved_stub_thunk_pages;
+struct ScopedThunkPageList: std::vector<uint64_t> {
+	static constexpr uint64_t PAGE_SIZE = 4096;
+	~ScopedThunkPageList() {
+		for (const auto page: *this) {
+			(void)Libs::LibKernel::Memory::FreeGuestMemory(page, PAGE_SIZE);
+		}
+	}
+};
+static ScopedThunkPageList              g_unresolved_stub_thunk_pages;
 static uint64_t                         g_unresolved_stub_thunk_offset = 0;
 static constexpr uint64_t               UNRESOLVED_STUB_PAGE_SIZE      = 4096;
 
@@ -187,7 +216,7 @@ static uint64_t AllocateUnresolvedImportThunk(uint64_t record_address) {
 // guest return address and stack exactly as the direct call would. Counters live in ordinary
 // host memory, away from the executable page.
 static std::mutex            g_count_thunk_mutex;
-static std::vector<uint64_t> g_count_thunk_pages;
+static ScopedThunkPageList   g_count_thunk_pages;
 static uint64_t              g_count_thunk_offset = 0;
 
 static uint64_t GetCountingImportThunk(uint64_t target, const RelocationInfo& ri,
@@ -878,6 +907,17 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 	    info->access_violation_type == Common::HostException::AccessViolationType::Unknown) {
 		return false;
 	}
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	// If the fault happened in an external host DLL (e.g. CoreMessaging, USER32, graphics hooks),
+	// pass it to Windows SEH (__try/__except). Only fatal if in guest memory or emulator binary.
+	HMODULE host_mod = nullptr;
+	if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+	                           GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+	                       reinterpret_cast<LPCWSTR>(info->exception_address), &host_mod) != 0 &&
+	    host_mod != nullptr && host_mod != GetModuleHandleW(nullptr)) {
+		return false;
+	}
+#endif
 	// Report whatever guest context can be read safely before terminating: which guest thread
 	// faulted, the module the fault is in, the register file, the faulting code bytes, the top of
 	// its stack and the host call chain. One block through the log (the console and the printf
@@ -1298,7 +1338,7 @@ uint64_t RuntimeLinker::GetEntry() {
 
 	Common::LockGuard lock(m_mutex);
 
-	for (const auto* p: m_programs) {
+	for (const auto& p: m_programs) {
 		if (p->elf != nullptr && !p->elf->IsShared()) {
 			return p->elf->GetEntry() + p->base_vaddr;
 		}
@@ -1311,7 +1351,7 @@ uint64_t RuntimeLinker::GetProcParam() {
 
 	Common::LockGuard lock(m_mutex);
 
-	for (const auto* p: m_programs) {
+	for (const auto& p: m_programs) {
 		if (p->elf != nullptr && !p->elf->IsShared()) {
 			return p->proc_param_vaddr;
 		}
@@ -1326,7 +1366,7 @@ void RuntimeLinker::DbgDump(const std::string& folder) {
 
 	Common::LockGuard lock(m_mutex);
 
-	for (const auto* p: m_programs) {
+	for (const auto& p: m_programs) {
 		auto folder_str = Common::FixDirectorySlash(folder);
 		folder_str += Common::FilenameWithoutDirectory(Common::PathToGenericString(p->file_name));
 
@@ -1374,7 +1414,7 @@ void RuntimeLinker::RelocateAll() {
 
 	Common::LockGuard lock(m_mutex);
 
-	for (auto* p: m_programs) {
+	for (const auto& p: m_programs) {
 		Relocate(p);
 	}
 }
@@ -1398,9 +1438,10 @@ void RuntimeLinker::UnloadProgram(Program* program) {
 
 	auto it = std::find(m_programs.begin(), m_programs.end(), program);
 	EXIT_IF(it == m_programs.end());
+	auto removed_program = std::move(*it);
 	m_programs.erase(it);
 
-	for (auto* importer: m_programs) {
+	for (const auto& importer: m_programs) {
 		const auto& info = *importer->dynamic_info;
 		const auto rela_count =
 		    static_cast<uint32_t>(info.rela_table_total_size / sizeof(Elf64_Rela));
@@ -1441,7 +1482,7 @@ void RuntimeLinker::UnloadProgram(Program* program) {
 			}
 		});
 	}
-	DeleteProgram(program);
+	// removed_program's RAII destructor calls DeleteProgram(program) on scope exit.
 }
 
 RuntimeLinker::RuntimeLinker(): m_symbols(std::make_unique<SymbolDatabase>()) {
@@ -1481,7 +1522,7 @@ Program* RuntimeLinker::LoadProgram(const std::filesystem::path& elf_name) {
 		EXIT("elf is not valid: %s\n", Common::PathToString(elf_name).c_str());
 	}
 
-	m_programs.push_back(program_owner.release());
+	m_programs.emplace_back(std::move(program_owner));
 
 	if (!program->elf->IsShared()) {
 		program->fail_if_global_not_resolved = false;
@@ -1501,7 +1542,7 @@ void RuntimeLinker::SaveMainProgram(const std::filesystem::path& elf_name) {
 
 	Common::LockGuard lock(m_mutex);
 
-	for (const auto* p: m_programs) {
+	for (const auto& p: m_programs) {
 		EXIT_IF(p->elf == nullptr);
 
 		if (!p->elf->IsShared()) {
@@ -1550,8 +1591,9 @@ void RuntimeLinker::Execute(const std::filesystem::path& game_patch) {
 	RelocateAll();
 
 	if (!game_patch.empty()) {
+		const std::vector<Program*> program_views(m_programs.begin(), m_programs.end());
 		if (!GamePatch::Apply(game_patch, m_programs.empty() ? nullptr : m_programs.front(),
-		                      m_programs)) {
+		                      program_views)) {
 			EXIT("Failed to apply game cheat\n");
 		}
 	}
@@ -1592,9 +1634,6 @@ void RuntimeLinker::Clear() {
 	Common::LockGuard lock(m_mutex);
 	GamePatch::Clear();
 
-	for (auto* p: m_programs) {
-		DeleteProgram(p);
-	}
 	m_programs.clear();
 	for (const auto page: g_unresolved_stub_thunk_pages) {
 		EXIT_IF(!Libs::LibKernel::Memory::FreeGuestMemory(page, UNRESOLVED_STUB_PAGE_SIZE));
@@ -1602,6 +1641,14 @@ void RuntimeLinker::Clear() {
 	g_unresolved_stub_thunk_pages.clear();
 	g_unresolved_stub_thunk_offset = 0;
 	g_stubbed_imports.clear();
+	{
+		std::scoped_lock count_lock(g_count_thunk_mutex);
+		for (const auto page: g_count_thunk_pages) {
+			EXIT_IF(!Libs::LibKernel::Memory::FreeGuestMemory(page, UNRESOLVED_STUB_PAGE_SIZE));
+		}
+		g_count_thunk_pages.clear();
+		g_count_thunk_offset = 0;
+	}
 	if (g_invalid_memory != 0) {
 		EXIT_IF(!Libs::LibKernel::Memory::FreeGuestMemory(g_invalid_memory, 4096));
 		g_invalid_memory = 0;
@@ -1641,7 +1688,7 @@ void RuntimeLinker::Resolve(const std::string& name, SymbolType type, Program* p
 				}
 			}
 
-			for (auto* p: m_programs) {
+			for (const auto& p: m_programs) {
 				if (p != nullptr && p->export_symbols != nullptr) {
 					if (const auto* rec = p->export_symbols->FindByNid(nid, type); rec != nullptr) {
 						*out = *rec;
@@ -1670,7 +1717,7 @@ void RuntimeLinker::Resolve(const std::string& name, SymbolType type, Program* p
 			}
 
 			if (rec == nullptr) {
-				for (auto* p: m_programs) {
+				for (const auto& p: m_programs) {
 					const auto& libs = p->dynamic_info->export_libs;
 					const auto& modules = p->dynamic_info->export_modules;
 					if (p->export_symbols == nullptr ||
@@ -1754,7 +1801,7 @@ Program* RuntimeLinker::FindProgramById(int32_t id) {
 		return m_programs.front();
 	}
 
-	for (auto* p: m_programs) {
+	for (const auto& p: m_programs) {
 		if (p->unique_id == id) {
 			return p;
 		}
@@ -1767,7 +1814,7 @@ Program* RuntimeLinker::FindProgramByFileName(const std::filesystem::path& elf_n
 	Common::LockGuard lock(m_mutex);
 
 	auto fixed_name = Common::FixFilenameSlash(Common::PathToGenericString(elf_name));
-	for (auto* p: m_programs) {
+	for (const auto& p: m_programs) {
 		if (Common::EqualNoCase(Common::FixFilenameSlash(Common::PathToGenericString(p->file_name)),
 		                        fixed_name)) {
 			return p;
@@ -1780,7 +1827,7 @@ Program* RuntimeLinker::FindProgramByFileName(const std::filesystem::path& elf_n
 Program* RuntimeLinker::FindProgramByAddr(uint64_t vaddr) {
 	Common::LockGuard lock(m_mutex);
 
-	for (auto* p: m_programs) {
+	for (const auto& p: m_programs) {
 		const auto* ehdr = p->elf->GetEhdr();
 		const auto* phdr = p->elf->GetPhdr();
 
@@ -1806,24 +1853,25 @@ void RuntimeLinker::StackTrace(uint64_t frame_ptr, uint64_t stack_ptr) {
 	void* stack[20];
 	int   depth = WalkGuestStack(frame_ptr, stack_ptr, stack, static_cast<int>(std::size(stack)));
 
-	LOGF("Stack trace [thread = %d]:\n", Common::Thread::GetThreadIdUnique());
+	std::printf("Stack trace [thread = %d]:\n", Common::Thread::GetThreadIdUnique());
 
 	for (int i = 0; i < depth; i++) {
 		auto  vaddr = reinterpret_cast<uint64_t>(stack[i]);
 		auto* p     = FindProgramByAddr(vaddr);
-		LOGF("[%d] %016" PRIx64 ", off=%016" PRIx64 ", %s\n", i, vaddr,
+		std::printf("[%d] %016" PRIx64 ", off=%016" PRIx64 ", %s\n", i, vaddr,
 		     (p == nullptr ? 0 : vaddr - p->base_vaddr),
 		     (p == nullptr
 		          ? "???"
 		          : Common::FilenameWithoutDirectory(Common::PathToGenericString(p->file_name))
 		                .c_str()));
 	}
+	std::fflush(stdout);
 }
 
 void RuntimeLinker::StopAllModules() {
 	Common::LockGuard lock(m_mutex);
 
-	for (auto* p: m_programs) {
+	for (const auto& p: m_programs) {
 		if (p->elf->IsShared() && p->dynamic_info->fini_vaddr != 0) {
 			StopModule(p, 0, nullptr, nullptr);
 		}
@@ -2165,6 +2213,9 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 }
 
 void RuntimeLinker::DeleteProgram(Program* p) {
+	if (p == nullptr) {
+		return;
+	}
 	auto program = std::unique_ptr<Program>(p);
 	if (g_tls_main_program == program.get()) {
 		g_tls_main_program = nullptr;
@@ -2465,7 +2516,7 @@ void RuntimeLinker::SetupTlsHandler(Program* program) {
 void RuntimeLinker::DeleteTlss(int thread_id) {
 	Common::LockGuard lock(m_mutex);
 
-	for (auto* p: m_programs) {
+	for (const auto& p: m_programs) {
 		DeleteTls(p, thread_id);
 	}
 }

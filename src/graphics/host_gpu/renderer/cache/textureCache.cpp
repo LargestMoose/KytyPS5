@@ -1,5 +1,6 @@
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
 
+#include "common/environment.h"
 #include "common/alignment.h"
 #include "common/assert.h"
 #include "common/hangTrace.h"
@@ -2104,7 +2105,7 @@ bool TextureCache::CopyImage(ImageId destination_id, ImageId source_id, const ch
 		Profiler::CountFrameEvent(Profiler::FrameEvent::ImageCopyD16);
 		lossless = false;
 		path     = "d16-convert";
-	} else {
+	} else if (destination.CanCopyViaBuffer(source)) {
 		if (source.backing.samples != 1 || destination.backing.samples != 1) {
 			EXIT("TextureCache: cross-format multisample image copy is unsupported\n");
 		}
@@ -2112,6 +2113,19 @@ bool TextureCache::CopyImage(ImageId destination_id, ImageId source_id, const ch
 		destination.CopyImageWithBuffer(source, copy_buffer, m_tiler);
 		Profiler::CountFrameEvent(Profiler::FrameEvent::ImageCopyViaBuffer);
 		path = "via-buffer";
+	} else {
+		// Incompatible format or block sizes for direct GPU copy:
+		// Fall back to buffer-mediated reconstruction
+		if (AliasBytesEnabled() && !source.info.data.Empty()) {
+			MaterializeOwnedBytes(source.info.data, source_id, {}, "incompatible-copy");
+		}
+		destination.MarkBufferModified();
+		HangTrace::RecordTransfer(HangTrace::TransferKind::ImageCopy, "incompatible-fallback",
+		                          context, destination.info.data.address,
+		                          static_cast<uint32_t>(destination.backing.format),
+		                          destination.info.extent.width, destination.info.extent.height,
+		                          0, 0);
+		return false;
 	}
 	HangTrace::RecordTransfer(HangTrace::TransferKind::ImageCopy, path, context,
 	                          destination.info.data.address,
@@ -3955,10 +3969,7 @@ void TextureCache::MaterializeCmaskClear(ImageId id, const ImageDesc& desc,
 	// bytes become 0xFF. It needs no readback; the DCC helper when KYTY_DCC_GPU=1 created it,
 	// otherwise a CMASK-only instance.
 	// KYTY_CMASK_NATIVE=0 decides them by readback instead.
-	static const bool native_enabled = [] {
-		const auto* value = std::getenv("KYTY_CMASK_NATIVE");
-		return value == nullptr || std::strcmp(value, "0") != 0;
-	}();
+	static const bool native_enabled = Common::ReadEnvFlag("KYTY_CMASK_NATIVE", true);
 	static_assert(DccClearHelper::ClearCodes[0] == 0x00);
 	if (native_enabled && m_dcc_clear == nullptr && m_cmask_clear == nullptr) {
 		m_cmask_clear = std::make_unique<DccClearHelper>(m_graphics, m_scheduler);
@@ -4819,6 +4830,38 @@ void TextureCache::SyncAliasFromOwner(ImageId id) {
 			trace_sync("partial-owner", moved);
 			return;
 		}
+		// If formats or block structures are incompatible for GPU-to-GPU copy (e.g. BC block
+		// compressed vs uncompressed RGBA/R, or mismatched bytes-per-pixel in aliased memory),
+		// materialize the owner's bytes into guest buffer and rebuild this alias in its own format.
+		const bool same_transform =
+		    other->info.GetColorTransform() == image.info.GetColorTransform();
+		const bool source_depth = other->info.IsDepth();
+		const bool dest_depth   = image.info.IsDepth();
+		const bool direct_copy =
+		    same_transform &&
+		    (other->backing.image_type == image.backing.image_type ||
+		     (other->backing.image_type != vk::ImageType::e1D &&
+		      image.backing.image_type != vk::ImageType::e1D)) &&
+		    (other->backing.format == image.backing.format ||
+		     (!source_depth && !dest_depth &&
+		      vk::blockSize(other->backing.format) == vk::blockSize(image.backing.format)));
+		const bool can_shader_depth_color =
+		    same_transform && (source_depth != dest_depth);
+		const bool can_d16_copy =
+		    (source_depth != dest_depth);
+		const bool can_buffer_copy = image.CanCopyViaBuffer(*other);
+		const bool can_gpu_copy =
+		    direct_copy || can_shader_depth_color || can_d16_copy || can_buffer_copy;
+
+		if (!can_gpu_copy) {
+			if (AliasBytesEnabled()) {
+				const auto moved =
+				    MaterializeOwnedBytes(image.info.data, other_id, {}, "alias-sync-incompatible");
+				image.MarkBufferModified();
+				trace_sync("incompatible-owner", moved);
+				return;
+			}
+		}
 		// Skip the copy when this alias already holds exactly the owner's native bits: its last
 		// contents came from a lossless full copy of the owner (or the other way round) and
 		// neither image has been written since. Ownership moves exactly as after a copy.
@@ -5008,10 +5051,7 @@ bool TextureCache::ClearImageFromBuffer(CommandBuffer& command, uint64_t address
 	if (aspect == vk::ImageAspectFlagBits::eColor) {
 		// KYTY_WIDE_FILL_CLEAR (default off): a fill of an image with 64- or 128-bit texels is a clear
 		// too; otherwise only a zero RGBA16F fill and the 32-bit formats are.
-		static const bool wide_fill = [] {
-			const auto* value = std::getenv("KYTY_WIDE_FILL_CLEAR");
-			return value != nullptr && std::strcmp(value, "1") == 0;
-		}();
+		static const bool wide_fill = Common::ReadEnvEquals("KYTY_WIDE_FILL_CLEAR", "1");
 		if (!(wide_fill ? DecodeFilledColorClear(image.info.pixel_format, packed_clear, clear.color)
 		                : DecodeColorDwordFill(image.info.pixel_format, packed_clear, clear.color))) {
 			return false;
@@ -5467,10 +5507,8 @@ uint64_t TextureCache::MaterializeOwnedBytes(GuestRange range, ImageId only, Ima
 		// Match SafeToSyncIntoBuffer's CPU-dirty rejection. InitializeImage also excludes
 		// definitely CPU-dirty images from its own-byte preservation before a rebuild.
 		if (image->IsCpuDirty()) {
-			static const bool diagnose = [] {
-				const auto* value = std::getenv("KYTY_ALIAS_CPU_WRITE_DIAGNOSTICS");
-				return value != nullptr && std::strcmp(value, "1") == 0;
-			}();
+			static const bool diagnose =
+			    Common::ReadEnvEquals("KYTY_ALIAS_CPU_WRITE_DIAGNOSTICS", "1");
 			static std::atomic<uint32_t> logged {0};
 			if (diagnose && logged.fetch_add(1, std::memory_order_relaxed) < 8) {
 				std::fprintf(stderr,
@@ -5770,10 +5808,7 @@ uint64_t BufferCache::RecordImageDownload(Buffer& buffer, ImageId id, bool skip_
 // range GPU-dirty until a readback, and images created there later start from those bytes; the
 // Sky Garden water sampled such stale data (a never-written quarter-res input) and rendered white.
 bool BufferCache::ImageWritebackOnGpuWriteEnabled() {
-	static const bool enabled = [] {
-		const auto* value = std::getenv("KYTY_IMAGE_WRITEBACK_ON_GPU_WRITE");
-		return value != nullptr && std::strcmp(value, "0") != 0;
-	}();
+	static const bool enabled = Common::ReadEnvFlag("KYTY_IMAGE_WRITEBACK_ON_GPU_WRITE", false);
 	return enabled;
 }
 

@@ -463,6 +463,10 @@ add_gpu_blit_shader(gpu_blit_color32_to_depth gpu_blit_color32_to_depth.frag)
 add_gpu_blit_shader(gpu_video_out_overlay gpu_video_out_overlay.frag)
 add_gpu_blit_shader(gpu_video_out_downscale gpu_video_out_downscale.frag)
 add_gpu_blit_shader(gpu_imgui_hdr gpu_video_out_overlay.frag -DIMGUI_HDR=1)
+add_gpu_blit_shader(gpu_upscale_fsr_easu gpu_upscale_fsr_easu.frag)
+add_gpu_blit_shader(gpu_upscale_fsr_rcas gpu_upscale_fsr_rcas.frag)
+add_gpu_blit_shader(gpu_upscale_dlss_tsr gpu_upscale_dlss_tsr.frag)
+add_gpu_blit_shader(gpu_frame_gen_interpolate gpu_frame_gen_interpolate.frag)
 list(APPEND kyty_emulator_src ${gpu_blit_shader_headers})
 
 set(gpu_dcc_generated_dir "${PROJECT_BINARY_DIR}/gpu_dcc_shaders")
@@ -694,6 +698,13 @@ add_executable(bit_array_tests EXCLUDE_FROM_ALL
 )
 target_include_directories(bit_array_tests PRIVATE ${inc_headers})
 
+add_executable(slot_vector_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/SlotVectorTests.cpp")
+target_link_libraries(slot_vector_tests common)
+target_include_directories(slot_vector_tests PRIVATE ${inc_headers})
+
+add_executable(environment_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/EnvironmentTests.cpp")
+target_include_directories(environment_tests PRIVATE ${inc_headers})
+
 add_executable(hang_watchdog_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/HangWatchdogTests.cpp")
 target_link_libraries(hang_watchdog_tests common)
 target_include_directories(hang_watchdog_tests PRIVATE ${inc_headers})
@@ -766,10 +777,33 @@ target_compile_definitions(u59_preset_tests PRIVATE
 if(LINUX)
 	target_link_libraries(u59_preset_tests Threads::Threads)
 endif()
+
+# EngineProfile (common/engineProfile.h): automatic game engine fingerprinting and optimization
+# presets for PlayStation Studios and third-party engine families.
+add_executable(engine_profile_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/EngineProfileTests.cpp"
+)
+target_link_libraries(engine_profile_tests common)
+target_include_directories(engine_profile_tests PRIVATE ${inc_headers})
+target_compile_definitions(engine_profile_tests PRIVATE
+	KYTY_ENGINE_PRESETS_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tools/engine-presets")
+if(LINUX)
+	target_link_libraries(engine_profile_tests Threads::Threads)
+endif()
 add_executable(lru_cache_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/LruCacheTests.cpp"
 )
 target_include_directories(lru_cache_tests PRIVATE ${inc_headers})
+
+add_executable(upscaler_frame_gen_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/UpscalerFrameGenTests.cpp"
+	${gpu_blit_shader_headers}
+)
+target_link_libraries(upscaler_frame_gen_tests common Vulkan::Headers)
+target_include_directories(upscaler_frame_gen_tests PRIVATE ${inc_headers} "${PROJECT_BINARY_DIR}")
+if(LINUX)
+	target_link_libraries(upscaler_frame_gen_tests Threads::Threads)
+endif()
 
 # KYTY_FUNCTION_ARRAY_SHRINK: the SPIR-V pass that shrinks Function-storage arrays to their proven
 # index bound (graphics/host_gpu/spirvLocalArrays.h).
@@ -1234,6 +1268,8 @@ if(BUILD_TESTING)
 	add_test(NAME avplayer_file COMMAND $<TARGET_FILE:avplayer_file_tests>)
 	add_test(NAME vdecsw COMMAND $<TARGET_FILE:vdecsw_tests>)
 	add_test(NAME bit_array COMMAND $<TARGET_FILE:bit_array_tests>)
+	add_test(NAME slot_vector COMMAND $<TARGET_FILE:slot_vector_tests>)
+	add_test(NAME environment COMMAND $<TARGET_FILE:environment_tests>)
 	add_test(NAME hang_watchdog COMMAND $<TARGET_FILE:hang_watchdog_tests>)
 	add_test(NAME hang_watchdog_fire COMMAND $<TARGET_FILE:hang_watchdog_tests> --fire)
 	add_test(NAME hang_watchdog_fatal_shutdown COMMAND $<TARGET_FILE:hang_watchdog_tests> --fatal-shutdown)
@@ -2466,6 +2502,8 @@ if(BUILD_TESTING)
 		avplayer_file_tests
 		vdecsw_tests
 		bit_array_tests
+		slot_vector_tests
+		environment_tests
 		lod_stats_report_tests
 		occlusion_pairs_tests
 		occlusion_query_state_tests

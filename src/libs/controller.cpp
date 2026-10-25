@@ -1,5 +1,6 @@
 #include "libs/controller.h"
 
+#include "common/environment.h"
 #include <SDL3/SDL.h>
 #include "common/assert.h"
 #include "common/common.h"
@@ -509,10 +510,7 @@ void EmergencyShutdown() {
 }
 
 static bool HostInputOnly() {
-	static const bool enabled = [] {
-		const char* value = std::getenv("KYTY_HOST_INPUT_ONLY");
-		return value != nullptr && std::strcmp(value, "1") == 0;
-	}();
+	static const bool enabled = Common::ReadEnvEquals("KYTY_HOST_INPUT_ONLY", "1");
 	return enabled;
 }
 
@@ -1269,7 +1267,8 @@ int GameController::OpenPort(int user_id, int type, int index) {
 			return PAD_ERROR_NOT_INITIALIZED;
 		}
 		if (!PadOpenArgsAreValid(user_id, type, index)) {
-			return PAD_ERROR_INVALID_ARG;
+			return (type != 0 || index != 0 || user_id == 255) ? PAD_ERROR_NO_HANDLE
+			                                                   : PAD_ERROR_INVALID_ARG;
 		}
 		if (m_port_state == PortState::Open) {
 			return PAD_ERROR_ALREADY_OPENED;

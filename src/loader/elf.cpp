@@ -4,8 +4,14 @@
 #include "common/file.h"
 #include "common/logging/log.h"
 
+#include <algorithm>
+#include <array>
 #include <cstring>
+#include <format>
 #include <memory>
+#include <ranges>
+#include <span>
+#include <string_view>
 
 namespace Loader {
 
@@ -121,118 +127,131 @@ static std::unique_ptr<char[]> LoadStrTable(Common::File& f, uint64_t offset, ui
 	return str_table;
 }
 
-static void DbgPrintEhdr64(Elf64_Ehdr* ehdr, Common::File& f) {
+static void DbgPrintEhdr64(const Elf64_Ehdr* ehdr, Common::File& f) {
 	f.Printf("ehdr->e_ident = ");
 	for (auto i: ehdr->e_ident) {
-		f.Printf("%02x", i);
+		f.Printf("%s", std::format("{:02x}", i).c_str());
 	}
 	f.Printf("\n");
 
-	f.Printf("ehdr->e_type = 0x%04" PRIx16 "\n", ehdr->e_type);
-	f.Printf("ehdr->e_machine = 0x%04" PRIx16 "\n", ehdr->e_machine);
-	f.Printf("ehdr->e_version = 0x%08" PRIx32 "\n", ehdr->e_version);
-
-	f.Printf("ehdr->e_entry = 0x%016" PRIx64 "\n", ehdr->e_entry);
-	f.Printf("ehdr->e_phoff = 0x%016" PRIx64 "\n", ehdr->e_phoff);
-	f.Printf("ehdr->e_shoff = 0x%016" PRIx64 "\n", ehdr->e_shoff);
-	f.Printf("ehdr->e_flags = 0x%08" PRIx32 "\n", ehdr->e_flags);
-	f.Printf("ehdr->e_ehsize = 0x%04" PRIx16 "\n", ehdr->e_ehsize);
-	f.Printf("ehdr->e_phentsize = 0x%04" PRIx16 "\n", ehdr->e_phentsize);
-	f.Printf("ehdr->e_phnum = %" PRIu16 "\n", ehdr->e_phnum);
-	f.Printf("ehdr->e_shentsize = 0x%04" PRIx16 "\n", ehdr->e_shentsize);
-	f.Printf("ehdr->e_shnum = %" PRIu16 "\n", ehdr->e_shnum);
-	f.Printf("ehdr->e_shstrndx = %" PRIu16 "\n", ehdr->e_shstrndx);
+	f.Printf("%s", std::format("ehdr->e_type = 0x{:04x}\n"
+	                           "ehdr->e_machine = 0x{:04x}\n"
+	                           "ehdr->e_version = 0x{:08x}\n"
+	                           "ehdr->e_entry = 0x{:016x}\n"
+	                           "ehdr->e_phoff = 0x{:016x}\n"
+	                           "ehdr->e_shoff = 0x{:016x}\n"
+	                           "ehdr->e_flags = 0x{:08x}\n"
+	                           "ehdr->e_ehsize = 0x{:04x}\n"
+	                           "ehdr->e_phentsize = 0x{:04x}\n"
+	                           "ehdr->e_phnum = {}\n"
+	                           "ehdr->e_shentsize = 0x{:04x}\n"
+	                           "ehdr->e_shnum = {}\n"
+	                           "ehdr->e_shstrndx = {}\n",
+	                           ehdr->e_type, ehdr->e_machine, ehdr->e_version, ehdr->e_entry,
+	                           ehdr->e_phoff, ehdr->e_shoff, ehdr->e_flags, ehdr->e_ehsize,
+	                           ehdr->e_phentsize, ehdr->e_phnum, ehdr->e_shentsize, ehdr->e_shnum,
+	                           ehdr->e_shstrndx)
+	                   .c_str());
 }
 
-static void DbgPrintPhdr64(Elf64_Phdr* phdr, Common::File& f) {
-	f.Printf("phdr->p_type = 0x%08" PRIx32 "\n", phdr->p_type);
-	f.Printf("phdr->p_flags = 0x%08" PRIx32 "\n", phdr->p_flags);
-	f.Printf("phdr->p_offset = 0x%016" PRIx64 "\n", phdr->p_offset);
-	f.Printf("phdr->p_vaddr = 0x%016" PRIx64 "\n", phdr->p_vaddr);
-	f.Printf("phdr->p_paddr = 0x%016" PRIx64 "\n", phdr->p_paddr);
-	f.Printf("phdr->p_filesz = 0x%016" PRIx64 "\n", phdr->p_filesz);
-	f.Printf("phdr->p_memsz = 0x%016" PRIx64 "\n", phdr->p_memsz);
-	f.Printf("phdr->p_align = 0x%016" PRIx64 "\n", phdr->p_align);
+static void DbgPrintPhdr64(const Elf64_Phdr* phdr, Common::File& f) {
+	f.Printf("%s", std::format("phdr->p_type = 0x{:08x}\n"
+	                           "phdr->p_flags = 0x{:08x}\n"
+	                           "phdr->p_offset = 0x{:016x}\n"
+	                           "phdr->p_vaddr = 0x{:016x}\n"
+	                           "phdr->p_paddr = 0x{:016x}\n"
+	                           "phdr->p_filesz = 0x{:016x}\n"
+	                           "phdr->p_memsz = 0x{:016x}\n"
+	                           "phdr->p_align = 0x{:016x}\n",
+	                           phdr->p_type, phdr->p_flags, phdr->p_offset, phdr->p_vaddr,
+	                           phdr->p_paddr, phdr->p_filesz, phdr->p_memsz, phdr->p_align)
+	                   .c_str());
 }
 
-static void DbgPrintShdr64(Elf64_Shdr* shdr, Common::File& f) {
-	f.Printf("shdr->sh_name = %d\n", shdr->sh_name);
-	f.Printf("shdr->sh_type = 0x%08" PRIx32 "\n", shdr->sh_type);
-	f.Printf("shdr->sh_flags = 0x%016" PRIx64 "\n", shdr->sh_flags);
-	f.Printf("shdr->sh_addr = 0x%016" PRIx64 "\n", shdr->sh_addr);
-	f.Printf("shdr->sh_offset = 0x%016" PRIx64 "\n", shdr->sh_offset);
-	f.Printf("shdr->sh_size = 0x%016" PRIx64 "\n", shdr->sh_size);
-	f.Printf("shdr->sh_link = %" PRId32 "\n", shdr->sh_link);
-	f.Printf("shdr->sh_info = 0x%08" PRIx32 "\n", shdr->sh_info);
-	f.Printf("shdr->sh_addralign = 0x%016" PRIx64 "\n", shdr->sh_addralign);
-	f.Printf("shdr->sh_entsize = 0x%016" PRIx64 "\n", shdr->sh_entsize);
+static void DbgPrintShdr64(const Elf64_Shdr* shdr, Common::File& f) {
+	f.Printf("%s", std::format("shdr->sh_name = {}\n"
+	                           "shdr->sh_type = 0x{:08x}\n"
+	                           "shdr->sh_flags = 0x{:016x}\n"
+	                           "shdr->sh_addr = 0x{:016x}\n"
+	                           "shdr->sh_offset = 0x{:016x}\n"
+	                           "shdr->sh_size = 0x{:016x}\n"
+	                           "shdr->sh_link = {}\n"
+	                           "shdr->sh_info = 0x{:08x}\n"
+	                           "shdr->sh_addralign = 0x{:016x}\n"
+	                           "shdr->sh_entsize = 0x{:016x}\n",
+	                           shdr->sh_name, shdr->sh_type, shdr->sh_flags, shdr->sh_addr,
+	                           shdr->sh_offset, shdr->sh_size, shdr->sh_link, shdr->sh_info,
+	                           shdr->sh_addralign, shdr->sh_entsize)
+	                   .c_str());
 }
-
-// NOLINTNEXTLINE(cppcoreguidelines-macro-usage)
-#define DBG_NAME(tag)                                                                              \
-	case tag: name = #tag; break;
 
 static void DbgPrintDynamic64(const Elf64_Dyn* dyn, Common::File& f) {
-	const char* name = "Unknown";
-	switch (dyn->d_tag) {
-		DBG_NAME(DT_OS_HASH)
-		DBG_NAME(DT_HASH)
-		DBG_NAME(DT_OS_STRTAB)
-		DBG_NAME(DT_OS_STRSZ)
-		DBG_NAME(DT_STRTAB)
-		DBG_NAME(DT_STRSZ)
-		DBG_NAME(DT_OS_SYMTAB)
-		DBG_NAME(DT_SYMTAB)
-		DBG_NAME(DT_OS_HASHSZ)
-		DBG_NAME(DT_OS_SYMTABSZ)
-		DBG_NAME(DT_INIT)
-		DBG_NAME(DT_FINI)
-		DBG_NAME(DT_OS_PLTGOT)
-		DBG_NAME(DT_PLTGOT)
-		DBG_NAME(DT_OS_JMPREL)
-		DBG_NAME(DT_JMPREL)
-		DBG_NAME(DT_OS_PLTRELSZ)
-		DBG_NAME(DT_PLTRELSZ)
-		DBG_NAME(DT_OS_PLTREL)
-		DBG_NAME(DT_PLTREL)
-		DBG_NAME(DT_OS_RELA)
-		DBG_NAME(DT_RELA)
-		DBG_NAME(DT_OS_RELASZ)
-		DBG_NAME(DT_RELASZ)
-		DBG_NAME(DT_OS_RELAENT)
-		DBG_NAME(DT_RELAENT)
-		DBG_NAME(DT_INIT_ARRAY)
-		DBG_NAME(DT_INIT_ARRAYSZ)
-		DBG_NAME(DT_FINI_ARRAY)
-		DBG_NAME(DT_FINI_ARRAYSZ)
-		DBG_NAME(DT_PREINIT_ARRAY)
-		DBG_NAME(DT_PREINIT_ARRAYSZ)
-		DBG_NAME(DT_OS_SYMENT)
-		DBG_NAME(DT_SYMENT)
-		DBG_NAME(DT_DEBUG)
-		DBG_NAME(DT_TEXTREL)
-		DBG_NAME(DT_FLAGS)
-		DBG_NAME(DT_NEEDED)
-		DBG_NAME(DT_OS_NEEDED_MODULE)
-		DBG_NAME(DT_OS_NEEDED_MODULE_1)
-		DBG_NAME(DT_OS_IMPORT_LIB)
-		DBG_NAME(DT_OS_IMPORT_LIB_1)
-		DBG_NAME(DT_OS_IMPORT_LIB_ATTR)
-		DBG_NAME(DT_OS_FINGERPRINT)
-		DBG_NAME(DT_OS_ORIGINAL_FILENAME)
-		DBG_NAME(DT_OS_ORIGINAL_FILENAME_1)
-		DBG_NAME(DT_OS_MODULE_INFO)
-		DBG_NAME(DT_OS_MODULE_INFO_1)
-		DBG_NAME(DT_OS_MODULE_ATTR)
-		DBG_NAME(DT_SONAME)
-		DBG_NAME(DT_OS_EXPORT_LIB)
-		DBG_NAME(DT_OS_EXPORT_LIB_1)
-		DBG_NAME(DT_OS_EXPORT_LIB_ATTR)
-		DBG_NAME(DT_RELACOUNT)
-		DBG_NAME(DT_NULL)
-	}
-	f.Printf("d_tag = 0x%016" PRIx64 ", d_val = 0x%016" PRIx64 ", name = %s\n", dyn->d_tag,
-	         dyn->d_un.d_val, name);
+	struct DynTagEntry {
+		Elf64_Sxword     tag;
+		std::string_view name;
+	};
+	static constexpr std::array<DynTagEntry, 55> kDynTags {{
+	    {DT_OS_HASH, "DT_OS_HASH"},
+	    {DT_HASH, "DT_HASH"},
+	    {DT_OS_STRTAB, "DT_OS_STRTAB"},
+	    {DT_OS_STRSZ, "DT_OS_STRSZ"},
+	    {DT_STRTAB, "DT_STRTAB"},
+	    {DT_STRSZ, "DT_STRSZ"},
+	    {DT_OS_SYMTAB, "DT_OS_SYMTAB"},
+	    {DT_SYMTAB, "DT_SYMTAB"},
+	    {DT_OS_HASHSZ, "DT_OS_HASHSZ"},
+	    {DT_OS_SYMTABSZ, "DT_OS_SYMTABSZ"},
+	    {DT_INIT, "DT_INIT"},
+	    {DT_FINI, "DT_FINI"},
+	    {DT_OS_PLTGOT, "DT_OS_PLTGOT"},
+	    {DT_PLTGOT, "DT_PLTGOT"},
+	    {DT_OS_JMPREL, "DT_OS_JMPREL"},
+	    {DT_JMPREL, "DT_JMPREL"},
+	    {DT_OS_PLTRELSZ, "DT_OS_PLTRELSZ"},
+	    {DT_PLTRELSZ, "DT_PLTRELSZ"},
+	    {DT_OS_PLTREL, "DT_OS_PLTREL"},
+	    {DT_PLTREL, "DT_PLTREL"},
+	    {DT_OS_RELA, "DT_OS_RELA"},
+	    {DT_RELA, "DT_RELA"},
+	    {DT_OS_RELASZ, "DT_OS_RELASZ"},
+	    {DT_RELASZ, "DT_RELASZ"},
+	    {DT_OS_RELAENT, "DT_OS_RELAENT"},
+	    {DT_RELAENT, "DT_RELAENT"},
+	    {DT_INIT_ARRAY, "DT_INIT_ARRAY"},
+	    {DT_INIT_ARRAYSZ, "DT_INIT_ARRAYSZ"},
+	    {DT_FINI_ARRAY, "DT_FINI_ARRAY"},
+	    {DT_FINI_ARRAYSZ, "DT_FINI_ARRAYSZ"},
+	    {DT_PREINIT_ARRAY, "DT_PREINIT_ARRAY"},
+	    {DT_PREINIT_ARRAYSZ, "DT_PREINIT_ARRAYSZ"},
+	    {DT_OS_SYMENT, "DT_OS_SYMENT"},
+	    {DT_SYMENT, "DT_SYMENT"},
+	    {DT_DEBUG, "DT_DEBUG"},
+	    {DT_TEXTREL, "DT_TEXTREL"},
+	    {DT_FLAGS, "DT_FLAGS"},
+	    {DT_NEEDED, "DT_NEEDED"},
+	    {DT_OS_NEEDED_MODULE, "DT_OS_NEEDED_MODULE"},
+	    {DT_OS_NEEDED_MODULE_1, "DT_OS_NEEDED_MODULE_1"},
+	    {DT_OS_IMPORT_LIB, "DT_OS_IMPORT_LIB"},
+	    {DT_OS_IMPORT_LIB_1, "DT_OS_IMPORT_LIB_1"},
+	    {DT_OS_IMPORT_LIB_ATTR, "DT_OS_IMPORT_LIB_ATTR"},
+	    {DT_OS_FINGERPRINT, "DT_OS_FINGERPRINT"},
+	    {DT_OS_ORIGINAL_FILENAME, "DT_OS_ORIGINAL_FILENAME"},
+	    {DT_OS_ORIGINAL_FILENAME_1, "DT_OS_ORIGINAL_FILENAME_1"},
+	    {DT_OS_MODULE_INFO, "DT_OS_MODULE_INFO"},
+	    {DT_OS_MODULE_INFO_1, "DT_OS_MODULE_INFO_1"},
+	    {DT_OS_MODULE_ATTR, "DT_OS_MODULE_ATTR"},
+	    {DT_SONAME, "DT_SONAME"},
+	    {DT_OS_EXPORT_LIB, "DT_OS_EXPORT_LIB"},
+	    {DT_OS_EXPORT_LIB_1, "DT_OS_EXPORT_LIB_1"},
+	    {DT_OS_EXPORT_LIB_ATTR, "DT_OS_EXPORT_LIB_ATTR"},
+	    {DT_RELACOUNT, "DT_RELACOUNT"},
+	    {DT_NULL, "DT_NULL"},
+	}};
+	const auto       it   = std::ranges::find(kDynTags, dyn->d_tag, &DynTagEntry::tag);
+	const auto       name = it != kDynTags.end() ? it->name : std::string_view {"Unknown"};
+	f.Printf("%s", std::format("d_tag = 0x{:016x}, d_val = 0x{:016x}, name = {}\n",
+	                           static_cast<uint64_t>(dyn->d_tag), dyn->d_un.d_val, name)
+	                   .c_str());
 }
 
 Elf64::~Elf64() {
@@ -356,17 +375,10 @@ void Elf64::DbgDump(const std::string& folder) {
 			continue;
 		}
 
-		char str[512];
-		int  s = snprintf(str, 512, "phdr_%03d", i);
-		EXIT_NOT_IMPLEMENTED(s >= 512);
-
 		Common::File fout;
-		fout.Create(folder_str + str);
+		fout.Create(std::format("{}phdr_{:03d}", folder_str, i));
 
 		auto buf = std::make_unique<char[]>(static_cast<uint32_t>(m_phdr[i].p_filesz));
-
-		// m_f->Seek(m_phdr[i].p_offset);
-		// m_f->Read(buf, static_cast<uint32_t>(m_phdr[i].p_filesz));
 
 		LoadSegment(reinterpret_cast<uint64_t>(buf.get()), m_phdr[i].p_offset, m_phdr[i].p_filesz);
 
@@ -380,12 +392,8 @@ void Elf64::DbgDump(const std::string& folder) {
 			continue;
 		}
 
-		char str[512];
-		int  s = snprintf(str, 512, "shdr_%03d", i);
-		EXIT_NOT_IMPLEMENTED(s >= 512);
-
 		Common::File fout;
-		fout.Create(folder_str + str);
+		fout.Create(std::format("{}shdr_{:03d}", folder_str, i));
 
 		auto buf = std::make_unique<char[]>(static_cast<uint32_t>(m_shdr[i].sh_size));
 
@@ -424,34 +432,31 @@ void Elf64::DbgDump(const std::string& folder) {
 	fout.Close();
 }
 
-uint64_t Elf64::GetEntry() {
+uint64_t Elf64::GetEntry() const {
 	return m_ehdr->e_entry;
 }
 
 bool Elf64::IsSelf() const {
-	if (m_f == nullptr || m_f->IsInvalid()) {
+	if (m_f == nullptr || m_f->IsInvalid() || m_self == nullptr) {
 		return false;
 	}
 
-	if (m_self == nullptr) {
-		return false;
-	}
-
-	const bool known_magic = (m_self->ident[0] == 0x4f && m_self->ident[1] == 0x15 &&
-	                          m_self->ident[2] == 0x3d && m_self->ident[3] == 0x1d) ||
-	                         (m_self->ident[0] == 0x54 && m_self->ident[1] == 0x14 &&
-	                          m_self->ident[2] == 0xf5 && m_self->ident[3] == 0xee);
+	const std::span<const uint8_t, 12> ident {m_self->ident};
+	constexpr std::array<uint8_t, 4>   magic_v1 {0x4f, 0x15, 0x3d, 0x1d};
+	constexpr std::array<uint8_t, 4>   magic_v2 {0x54, 0x14, 0xf5, 0xee};
+	const auto                         ident_head = ident.first<4>();
+	const bool known_magic = std::ranges::equal(ident_head, magic_v1) ||
+	                         std::ranges::equal(ident_head, magic_v2);
 	if (!known_magic) {
 		return false;
 	}
 
+	constexpr std::array<uint8_t, 8> tail_v1 {0x00, 0x01, 0x01, 0x12, 0x01, 0x01, 0x00, 0x00};
+	constexpr std::array<uint8_t, 8> tail_v2 {0x10, 0x01, 0x01, 0x12, 0x01, 0x01, 0x00, 0x10};
+	const auto                       ident_tail = ident.subspan<4, 8>();
 	const bool known_ident_tail =
-	    (m_self->ident[4] == 0x00 && m_self->ident[5] == 0x01 && m_self->ident[6] == 0x01 &&
-	     m_self->ident[7] == 0x12 && m_self->ident[8] == 0x01 && m_self->ident[9] == 0x01 &&
-	     m_self->ident[10] == 0x00 && m_self->ident[11] == 0x00 && m_self->unknown == 0x22) ||
-	    (m_self->ident[4] == 0x10 && m_self->ident[5] == 0x01 && m_self->ident[6] == 0x01 &&
-	     m_self->ident[7] == 0x12 && m_self->ident[8] == 0x01 && m_self->ident[9] == 0x01 &&
-	     m_self->ident[10] == 0x00 && m_self->ident[11] == 0x10 && m_self->unknown == 0x32);
+	    (std::ranges::equal(ident_tail, tail_v1) && m_self->unknown == 0x22) ||
+	    (std::ranges::equal(ident_tail, tail_v2) && m_self->unknown == 0x32);
 
 	if (!known_ident_tail) {
 		LOGF("Unknown SELF file\n");

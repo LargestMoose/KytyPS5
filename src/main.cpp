@@ -7,6 +7,7 @@
 #include "common/threads.h"
 #include "common/virtualMemory.h"
 #include "emulator.h"
+#include "common/u59Preset.h"
 #include "kytyGitVersion.h"
 #include "loader/x64InstructionEmulator.h"
 
@@ -23,11 +24,20 @@
 #include <magic_enum.hpp>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
+#endif
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #endif
 #include <windows.h>
 #endif
@@ -143,7 +153,11 @@ static void PrintUsage() {
 	         "                                      the game sound. Default: 100.\n");
 	::printf("  --audio-objects <on|off>            Play 3D audio objects (off: dropped). Default: on.\n");
 	::printf(
-	    "  --present-mode <value>               Fifo, Mailbox, or Immediate. Default: Mailbox.\n");
+	    "  --present-mode <value>               Fifo, Mailbox, or Immediate. Default: Mailbox.\n"
+	    "  --upscaler <off|fsr|dlss>            Spatial/temporal super-resolution upscaler. Default: off.\n"
+	    "  --upscale-quality <value>            native, quality, balanced, performance, ultra_performance. Default: quality.\n"
+	    "  --upscale-sharpness <0-100>          Upscaler RCAS sharpening strength. Default: 50.\n"
+	    "  --frame-gen <on|off>                 Motion-compensated frame generation. Default: off.\n");
 	::printf(
 	    "  --gpu <index>                        Vulkan physical device index. Default: auto.\n");
 	::printf("  --fullscreen                         Run in borderless desktop fullscreen.\n");
@@ -531,6 +545,22 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
 				return false;
 			}
+		} else if (arg == "--upscaler") {
+			options.config.upscaler_type = Config::ParseUpscalerType(value);
+		} else if (arg == "--upscale-quality") {
+			options.config.upscale_quality = Config::ParseUpscaleQuality(value);
+		} else if (arg == "--upscale-sharpness") {
+			uint32_t sharpness = 50;
+			if (!ParseUint32(value, sharpness)) {
+				::printf("invalid upscale sharpness: %s\n", value.c_str());
+				return false;
+			}
+			options.config.upscale_sharpness = std::min(sharpness, 100u);
+		} else if (arg == "--frame-gen") {
+			if (!ParseBool(value, options.config.frame_generation_enabled)) {
+				::printf("invalid boolean for %s: %s\n", arg.c_str(), value.c_str());
+				return false;
+			}
 		} else if (arg == "--present-mode") {
 			if (!ParseEnum(value, options.config.present_mode)) {
 				::printf("invalid present mode: %s\n", value.c_str());
@@ -750,7 +780,33 @@ static void InitCudaEarly() {
 
 static int Main(int argc, char* argv[]) {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+
+#if 1
+#endif
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	InitCudaEarly();
+	// If launched standalone from CLI without launcher, auto-apply u59-preset.json if present
+	if (std::getenv("KYTY_SRT_VARIANT_READS") == nullptr) {
+		wchar_t exe_buf[MAX_PATH] {};
+		GetModuleFileNameW(nullptr, exe_buf, MAX_PATH);
+		const std::filesystem::path exe_dir = std::filesystem::path(exe_buf).parent_path();
+		const auto result = Common::U59Preset::Load({
+			exe_dir,
+			exe_dir / "tools",
+			exe_dir.parent_path() / "tools",
+			std::filesystem::current_path(),
+			std::filesystem::current_path() / "tools"
+		});
+		if (result.status == Common::U59Preset::Status::Loaded) {
+			for (const auto& entry: result.entries) {
+				if (std::getenv(entry.key.c_str()) == nullptr) {
+					_putenv_s(entry.key.c_str(), entry.value.c_str());
+				}
+			}
+		}
+	}
+#endif
+
 #endif
 	VirtualMemory::Init();
 	InitializeThreads();

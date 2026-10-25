@@ -8,13 +8,22 @@
 #include "common/threads.h"
 
 #include <algorithm>
+#include <array>
+#include <bit>
 #include <charconv>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
+#include <format>
+#include <functional>
 #include <nlohmann/json.hpp>
+#include <optional>
+#include <ranges>
+#include <span>
 #include <string>
 #include <string_view>
+#include <variant>
+#include <version>
 #include <vector>
 
 namespace Loader {
@@ -40,17 +49,9 @@ public:
 	void DbgPrint();
 
 private:
-	enum class ParamType {
-		Text,
-		Int,
-	};
-
 	struct Param {
-		std::string name;
-		ParamType   type = ParamType::Text;
-		std::string string_value;
-		std::string string_utf8;
-		int32_t     int_value = 0;
+		std::string                      name;
+		std::variant<std::string, int32_t> value;
 	};
 
 	void   OpenJson(const std::filesystem::path& file_name);
@@ -126,9 +127,12 @@ void Psf::OpenJson(const std::filesystem::path& file_name) {
 		return;
 	}
 
-	std::string              default_language;
-	std::vector<std::string> localized_languages;
-	std::vector<std::string> localized_titles;
+	struct LocalizedTitle {
+		std::string language;
+		std::string title;
+	};
+	std::string                 default_language;
+	std::vector<LocalizedTitle> localized_titles;
 
 	const auto* json_begin = reinterpret_cast<const char*>(buf.data());
 	const auto* json_end   = json_begin + buf.size();
@@ -191,29 +195,29 @@ void Psf::OpenJson(const std::filesystem::path& file_name) {
 			}
 			auto title_it = it->find("titleName");
 			if (title_it != it->end() && title_it->is_string()) {
-				localized_languages.push_back(it.key());
-				localized_titles.push_back(title_it->get_ref<const std::string&>());
+				localized_titles.push_back(
+				    {it.key(), title_it->get_ref<const std::string&>()});
 			}
 		}
 	}
 
 	std::string title;
-	for (size_t i = 0; i < localized_titles.size(); i++) {
-		if (!default_language.empty() && localized_languages[i] == default_language) {
-			title = localized_titles[i];
-			break;
+	if (!default_language.empty()) {
+		if (const auto it = std::ranges::find(localized_titles, default_language,
+		                                      &LocalizedTitle::language);
+		    it != localized_titles.end()) {
+			title = it->title;
 		}
 	}
 	if (title.empty()) {
-		for (size_t i = 0; i < localized_titles.size(); i++) {
-			if (localized_languages[i] == "en-US") {
-				title = localized_titles[i];
-				break;
-			}
+		if (const auto it =
+		        std::ranges::find(localized_titles, std::string_view {"en-US"}, &LocalizedTitle::language);
+		    it != localized_titles.end()) {
+			title = it->title;
 		}
 	}
 	if (title.empty() && !localized_titles.empty()) {
-		title = localized_titles[0];
+		title = localized_titles.front().title;
 	}
 	if (!title.empty()) {
 		AddParamString("TITLE", title);
@@ -245,55 +249,40 @@ void Psf::DbgPrint() {
 	}
 
 	for (const auto& param: m_params) {
-		LOGF("%s, ", param.name.c_str());
-
-		switch (param.type) {
-			case ParamType::Text: {
-				auto str = Common::ReplaceChar(param.string_value, '\n', ',');
-				LOGF("string = %s\n", str.c_str());
-				break;
-			}
-			case ParamType::Int:
-				LOGF("int = 0x%08" PRIx32 "\n", static_cast<uint32_t>(param.int_value));
-				break;
-			default: EXIT("unknown type\n");
+		if (const auto* text = std::get_if<std::string>(&param.value)) {
+			const auto str = Common::ReplaceChar(*text, '\n', ',');
+			LOGF("%s\n", std::format("{}, string = {}", param.name, str).c_str());
+			continue;
 		}
+		if (const auto* number = std::get_if<int32_t>(&param.value)) {
+			LOGF("%s\n",
+			     std::format("{}, int = 0x{:08x}", param.name, static_cast<uint32_t>(*number))
+			         .c_str());
+			continue;
+		}
+		EXIT("unknown type\n");
 	}
 }
 
 Psf::Param* Psf::FindParam(const char* name) {
-	for (auto& param: m_params) {
-		if (param.name == name) {
-			return &param;
-		}
-	}
-
-	return nullptr;
+	const auto it = std::ranges::find(m_params, std::string_view {name}, &Param::name);
+	return it != m_params.end() ? &*it : nullptr;
 }
 
 void Psf::AddParamString(const std::string& name, const std::string& value) {
-	auto* param = FindParam(name.c_str());
-	if (param == nullptr) {
-		m_params.push_back({});
-		param       = &m_params.back();
-		param->name = name;
+	if (auto* param = FindParam(name.c_str()); param != nullptr) {
+		param->value = value;
+		return;
 	}
-
-	param->type         = ParamType::Text;
-	param->string_utf8  = value;
-	param->string_value = value;
+	m_params.push_back({name, value});
 }
 
 void Psf::AddParamInt(const std::string& name, int32_t value) {
-	auto* param = FindParam(name.c_str());
-	if (param == nullptr) {
-		m_params.push_back({});
-		param       = &m_params.back();
-		param->name = name;
+	if (auto* param = FindParam(name.c_str()); param != nullptr) {
+		param->value = value;
+		return;
 	}
-
-	param->type      = ParamType::Int;
-	param->int_value = value;
+	m_params.push_back({name, value});
 }
 
 bool Psf::GetParamInt(const char* name, int32_t* value) {
@@ -302,12 +291,16 @@ bool Psf::GetParamInt(const char* name, int32_t* value) {
 	if (!m_opened) {
 		return false;
 	}
-	if (auto* param = FindParam(name); param != nullptr && param->type == ParamType::Int) {
-		*value = param->int_value;
-		return true;
+	const auto* param = FindParam(name);
+	if (param == nullptr) {
+		return false;
 	}
-
-	return false;
+	const auto* number = std::get_if<int32_t>(&param->value);
+	if (number == nullptr) {
+		return false;
+	}
+	*value = *number;
+	return true;
 }
 
 bool Psf::GetParamString(const char* name, std::string* value) {
@@ -316,12 +309,16 @@ bool Psf::GetParamString(const char* name, std::string* value) {
 	if (!m_opened) {
 		return false;
 	}
-	if (auto* param = FindParam(name); param != nullptr && param->type == ParamType::Text) {
-		*value = param->string_value;
-		return true;
+	const auto* param = FindParam(name);
+	if (param == nullptr) {
+		return false;
 	}
-
-	return false;
+	const auto* text = std::get_if<std::string>(&param->value);
+	if (text == nullptr) {
+		return false;
+	}
+	*value = *text;
+	return true;
 }
 
 bool Psf::GetParamString(const char* name, char* value, size_t value_size) {
@@ -330,13 +327,16 @@ bool Psf::GetParamString(const char* name, char* value, size_t value_size) {
 	if (!m_opened) {
 		return false;
 	}
-	if (auto* param = FindParam(name); param != nullptr && param->type == ParamType::Text &&
-	                                   param->string_utf8.size() + 1 <= value_size) {
-		std::memcpy(value, param->string_utf8.c_str(), param->string_utf8.size() + 1);
-		return true;
+	const auto* param = FindParam(name);
+	if (param == nullptr) {
+		return false;
 	}
-
-	return false;
+	const auto* text = std::get_if<std::string>(&param->value);
+	if (text == nullptr || text->size() + 1 > value_size) {
+		return false;
+	}
+	std::memcpy(value, text->c_str(), text->size() + 1);
+	return true;
 }
 
 uint64_t Psf::GetFlexibleMemorySize() {
@@ -509,22 +509,22 @@ void PlayGo::OpenChunkManifest(const std::filesystem::path& file_name) {
 	auto buf = f.ReadWholeBuffer();
 	f.Close();
 
-	constexpr uint8_t id_field[] = {0x08, 'i', 'd', 0x00};
-	bool              chunks[1000] {};
-	uint32_t          max_chunk_id = 0;
-	bool              found        = false;
-	const auto*       data         = buf.data();
+	constexpr std::array<std::byte, 4> id_field {
+	    std::byte {0x08}, std::byte {'i'}, std::byte {'d'}, std::byte {0x00}};
+	std::array<bool, 1000>          chunks {};
+	uint32_t                        max_chunk_id = 0;
+	bool                            found        = false;
+	const std::span<const std::byte> bytes {buf};
 
-	for (size_t pos = 0; pos + sizeof(id_field) + sizeof(uint32_t) <= buf.size(); pos++) {
-		if (std::memcmp(data + pos, id_field, sizeof(id_field)) != 0) {
+	for (size_t pos = 0; pos + id_field.size() + sizeof(uint32_t) <= bytes.size(); pos++) {
+		if (!std::ranges::equal(bytes.subspan(pos, id_field.size()), id_field)) {
 			continue;
 		}
 
-		const auto* value = data + pos + sizeof(id_field);
-		const auto  chunk_id =
-		    static_cast<uint32_t>(value[0]) | (static_cast<uint32_t>(value[1]) << 8u) |
-		    (static_cast<uint32_t>(value[2]) << 16u) | (static_cast<uint32_t>(value[3]) << 24u);
-		if (chunk_id < 1000) {
+		std::array<std::byte, 4> raw_id {};
+		std::ranges::copy(bytes.subspan(pos + id_field.size(), raw_id.size()), raw_id.begin());
+		const auto chunk_id = std::bit_cast<uint32_t>(raw_id);
+		if (chunk_id < chunks.size()) {
 			chunks[chunk_id] = true;
 			max_chunk_id     = std::max(max_chunk_id, chunk_id);
 			found            = true;
@@ -532,7 +532,7 @@ void PlayGo::OpenChunkManifest(const std::filesystem::path& file_name) {
 	}
 
 	if (!found ||
-	    !std::all_of(chunks, chunks + max_chunk_id + 1, [](bool chunk) { return chunk; })) {
+	    !std::ranges::all_of(std::span {chunks}.first(max_chunk_id + 1), std::identity {})) {
 		LOGF("invalid chunk manifest: path=%s\n", Common::PathToString(file_name).c_str());
 		return;
 	}
@@ -616,24 +616,60 @@ void SystemContentLoadParamSfo(const std::filesystem::path& file_name) {
 	}
 }
 
+std::optional<int32_t> SystemContentParamSfoGetInt(const char* name) {
+	if (name == nullptr) {
+		return std::nullopt;
+	}
+
+	auto*   sc    = Common::Singleton<SystemContent>::Instance();
+	int32_t value = 0;
+	if (!sc->psf.GetParamInt(name, &value)) {
+		return std::nullopt;
+	}
+
+	return value;
+}
+
 bool SystemContentParamSfoGetInt(const char* name, int32_t* value) {
-	if (name == nullptr || value == nullptr) {
+	if (value == nullptr) {
 		return false;
 	}
 
-	auto* sc = Common::Singleton<SystemContent>::Instance();
+	const auto opt = SystemContentParamSfoGetInt(name);
+	if (!opt.has_value()) {
+		return false;
+	}
 
-	return sc->psf.GetParamInt(name, value);
+	*value = *opt;
+	return true;
+}
+
+std::optional<std::string> SystemContentParamSfoGetString(const char* name) {
+	if (name == nullptr) {
+		return std::nullopt;
+	}
+
+	auto*       sc = Common::Singleton<SystemContent>::Instance();
+	std::string value;
+	if (!sc->psf.GetParamString(name, &value)) {
+		return std::nullopt;
+	}
+
+	return value;
 }
 
 bool SystemContentParamSfoGetString(const char* name, std::string* value) {
-	if (name == nullptr || value == nullptr) {
+	if (value == nullptr) {
 		return false;
 	}
 
-	auto* sc = Common::Singleton<SystemContent>::Instance();
+	auto opt = SystemContentParamSfoGetString(name);
+	if (!opt.has_value()) {
+		return false;
+	}
 
-	return sc->psf.GetParamString(name, value);
+	*value = std::move(*opt);
+	return true;
 }
 
 bool SystemContentParamSfoGetString(const char* name, char* value, size_t value_size) {
@@ -644,6 +680,30 @@ bool SystemContentParamSfoGetString(const char* name, char* value, size_t value_
 	auto* sc = Common::Singleton<SystemContent>::Instance();
 
 	return sc->psf.GetParamString(name, value, value_size);
+}
+
+std::string SystemContentResolveTitleId() {
+	auto extract_from_content_id = []() -> std::optional<std::string> {
+		auto content_id = SystemContentParamSfoGetString("CONTENT_ID");
+		if (content_id.has_value() && content_id->size() == 36 && (*content_id)[6] == '-' &&
+		    (*content_id)[16] == '_') {
+			return content_id->substr(7, 9);
+		}
+		return std::nullopt;
+	};
+
+	auto title_id = SystemContentParamSfoGetString("TITLE_ID");
+	if (title_id.has_value() && title_id->empty()) {
+		title_id.reset();
+	}
+#if defined(__cpp_lib_optional) && __cpp_lib_optional >= 202110L
+	return title_id.or_else(extract_from_content_id).value_or(std::string {});
+#else
+	if (!title_id.has_value()) {
+		title_id = extract_from_content_id();
+	}
+	return title_id.value_or(std::string {});
+#endif
 }
 
 uint64_t SystemContentGetFlexibleMemorySize() {
